@@ -1,0 +1,508 @@
+#Load dependents
+library("plyr")
+library("dplyr")
+library("tidyr")
+library("RODBC")
+library("stringi")
+library("data.table")
+library("ggplot2")
+library("scales")
+library("choroplethr")
+library("devtools")
+
+#Clears workspace, save any files you want to save
+rm(list = ls())
+
+#Change working directory, ensure no files remain that are not affiliated with current analysis
+setwd("P:/R&A Shared Folder/Potential Affiliates/VSM Processing/Potential Affiliate Processing/ASCAP/ASCAP Domestic")
+
+#(LONG PROCESS) Create separate data frame for each file stored in directory
+for(i in 1:length(list.files())){
+  name <- paste("oo",i,sep = ".")
+  assign(name,read.csv(list.files()[i],stringsAsFactors = F, header = T))
+}
+
+#Remove superfluous variables 
+rm(i, name)
+
+#Creates a list that calls the data frame itself when chosen, rather than a character
+l.df <- lapply(ls(), function(x) if (class(get(x)) == "data.frame") get(x))
+
+#Creates mutated date frames with one additional column to create a DistDate
+for(i in 1:length(list.files())){
+  name <- paste("mdf",i,sep=".")
+  assign(name, mutate(l.df[[i]],DistDate = as.numeric(paste0(DistributionYear[nrow(l.df[[i]])],Distribution.Quarter[nrow(l.df[[i]])]))))
+}
+rm(i, name,list = ls(pattern = "oo"),l.df)
+
+#Data Frames have been updated, so you have to do the step below again as it was removed above, otherwise it has the old number of columns
+l.df <- lapply(ls(), function(x) if (class(get(x)) == "data.frame") get(x))
+
+#Create blank data frame for all data together
+OriginalData <- NULL
+
+#(LONG PROCESS) BIND ALL DATAFRAMES INTO ONE DATAFRAME#
+for(i in 1:length(l.df)){
+  OriginalData <- as.data.frame(rbind(l.df[[i]],OriginalData))
+}
+
+#Domestic Dates
+OriginalData$PerfQtr <- ifelse(substr(OriginalData$DistDate,5,5) < 3,OriginalData$DistDate-8,OriginalData$DistDate-2)
+rm(list=ls(pattern = "mdf"),i, l.df)
+
+#create variable of names of colunms no longer needed
+namedrop <- c("DistributionYear","Distribution.Quarter","Distribution","Statement.Recipient.ID", "Party.Name","Party.ID","Legal.Earner.Party.ID","Legal.Earner.Party.Name","Performance.Start.Date","Performance.End.Date","Survey.Type","Work.ID","CA.","Number.of.Plays","Adjustment.Indicator","Adjustment.Reason.Code","Original.Distribution.Date","Role.Type" , "Licensor.Flag","DistDate")
+
+#Drop columns
+OriginalData <- OriginalData[,!names(OriginalData) %in% namedrop]
+
+#replace NAs with 0
+OriginalData[is.na(OriginalData)] <- 0
+rm(namedrop)
+
+#Create All Foreign Data Frame
+setwd("P:/R&A Shared Folder/Potential Affiliates/VSM Processing/Potential Affiliate Processing/ASCAP/ASCAP Foreign")
+for(i in 1:length(list.files())){
+  name <- paste("oo",i,sep = ".")
+  assign(name,read.csv(list.files()[i],stringsAsFactors = F, header = T))
+}
+rm(i, name)
+l.df <- lapply(ls(), function(x) if (class(get(x)) == "data.frame") get(x))
+
+
+ForeignData <- NULL
+
+for(i in 1:length(l.df)){
+  ForeignData <- as.data.frame(rbind(l.df[[i]],ForeignData))
+}
+
+rm(list = ls(pattern = "oo"),l.df)
+
+#Create DistDate & PerfQtr
+ForeignData$DistDate <- as.integer(paste0(as.integer(stri_sub(ForeignData$Distribution.Date,-4,-1)),
+                        ifelse(as.integer(substr(ForeignData$Distribution.Date,1,2))<4,1,
+                        ifelse(as.integer(substr(ForeignData$Distribution.Date,1,2))<7,2,
+                        ifelse(as.integer(substr(ForeignData$Distribution.Date,1,2))<10,3,4)))))
+ForeignData$PerfQtr <-  ifelse(substr(ForeignData$DistDate,5,5) < 3,ForeignData$DistDate-8,ForeignData$DistDate-2)
+
+
+#Equalize Performance Quarters between Domestic and Foreign
+OriginalData <- OriginalData[OriginalData$PerfQtr %in% ForeignData$PerfQtr,]
+ForeignData <- ForeignData[ForeignData$PerfQtr %in% OriginalData$PerfQtr,]
+
+#Statement Recipients
+Earners <- distinct(select(OriginalData,Statement.Recipient.Name))
+#if more than one, need to follow below steps for each group
+
+#Does a SQL Like join to provide broader Music Genres, used to create summary sheets#
+setwd("P:/R&A Shared Folder/Potential Affiliates/VSM Processing/Potential Affiliate Processing")
+Genres <- as.data.frame(read.csv("Ascap Genres.csv"), stringsAsFactors = F)
+OriginalData <- as.data.frame(join(OriginalData, Genres, by = "Music.User.Genre"), stringsAsFactors = FALSE)
+rm(Genres)
+setwd("P:/R&A Shared Folder/Potential Affiliates/VSM Processing/Potential Affiliate Processing/ASCAP/ASCAP Domestic Output Files")
+
+
+#Create Song Summary by PerfQtr
+SongSummary <- summarise(group_by(OriginalData, PerfQtr, Work.Title, EE.Share), Earnings = sum(Dollars))
+SongSummary <- spread(SongSummary, PerfQtr, Earnings)
+SongSummary[is.na(SongSummary)] <- 0
+SongSummary$EE.Share <- ((SongSummary$EE.Share)*2)/100
+SongSummary$GrandTotal <- rowSums(SongSummary[,c(-1,-2)])
+SongSummary <- rbind(SongSummary, c("GrandTotal", colSums(SongSummary[,-1])))
+TopTenSongSummary <- SongSummary[1:10,]
+TopTenSongSummary$EE.Share <- NULL
+TopTenSongSummary$GrandTotal <- NULL
+TopTenSongSummary <- gather(TopTenSongSummary, "PerfQtr", "Earnings", -1)
+TopTenSongSummary$PerfQtr <- as.character(TopTenSongSummary$PerfQtr)
+TopTenSongSummary$Earnings <- as.numeric(as.character(TopTenSongSummary$Earnings))
+png("SongSummary.png", width = 850, height = 680)
+ggplot(TopTenSongSummary, aes(x=PerfQtr, y= Work.Title, fill = Earnings)) + geom_raster(aes(fill = Earnings)) + scale_fill_gradientn(colours=c("olivedrab1", "olivedrab","black")) + xlab("Performance Quarter") + ylab("Song Title") + ggtitle("Domestic Song Earnings")+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.background = element_blank(), axis.line = element_line(colour = "gray40"))
+dev.off()
+write.csv(SongSummary,"SongSummary.csv")
+rm(TopTenSongSummary)
+rm(SongSummary)
+
+#Create Genre Summary by PerfQtr
+GenreSummary <- summarise(group_by(OriginalData, PerfQtr, Genre), Earnings = sum(Dollars))
+GenreSummary$PerfQtr <- as.character(GenreSummary$PerfQtr)
+png("GenreSummary.png", width = 850, height = 680)
+ggplot(GenreSummary, aes(x=PerfQtr, y= Genre, fill = Earnings)) + geom_raster(aes(fill = Earnings)) +scale_fill_gradientn(colours=c("olivedrab1", "olivedrab","black")) + xlab("Performance Quarter") + ylab("Genre") + ggtitle("Domestic Earnings by Category")+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.background = element_blank(), axis.line = element_line(colour = "gray40"))
+dev.off()
+GenreSummary <- spread(GenreSummary, PerfQtr, Earnings)
+GenreSummary[is.na(GenreSummary)] <- 0
+GenreSummary$GrandTotal <- rowSums(GenreSummary[,-1])
+GenreSummary <- rbind(GenreSummary, c("GrandTotal", colSums(GenreSummary[,-1])))
+write.csv(GenreSummary,"GenreSummary.csv")
+rm(GenreSummary)
+
+#Create AllEarnings Summary by PerfQtr
+AllEarnings <- summarise(group_by(OriginalData, Statement.Recipient.Name, PerfQtr), Earnings = sum(Dollars))
+AllEarningsGraph<-NULL
+for(i in 2:5){
+  tempdf <- AllEarnings$Earnings[1] * 4 * i
+  AllEarningsGraph <- cbind(tempdf, AllEarningsGraph)
+  rm(tempdf)
+  colnames(AllEarningsGraph)[1]<- paste0("Mult",i,"x")
+}
+AllEarningsGraph<-as.data.frame(AllEarningsGraph)
+for(i in 1:nrow(AllEarnings)){
+  AllEarningsGraph[i,]<-AllEarningsGraph[1,]}
+for(i in 1:(nrow(AllEarnings)-1)){
+  AllEarningsGraph[i+1,]<-AllEarningsGraph[i,]-AllEarnings$Earnings[i+1]
+}
+Divisor <- AllEarningsGraph[1,]
+for(i in 1:nrow(AllEarningsGraph)){
+  AllEarningsGraph[i,] <- AllEarningsGraph[i,]/Divisor
+} 
+rm(i,Divisor)
+AllEarningsGraph$PerfQtr <- AllEarnings$PerfQtr
+AllEarningsGraph$PerfQtr <- as.factor(AllEarningsGraph$PerfQtr)
+AllEarningsGraph <- melt(AllEarningsGraph,id.vars = "PerfQtr")
+png("DomesticEarningsGraph.png", width = 850, height = 680)
+ggplot(AllEarningsGraph, aes(PerfQtr, value, col=variable, group = variable)) + geom_line() + xlab("Performance Quarter") + ylab("Advance Remaining") + ggtitle("Annualized Earnings Advance Recoup") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.background = element_blank()) + theme(legend.title = element_blank())
+dev.off()
+AllEarnings <- spread(AllEarnings, PerfQtr, Earnings)
+AllEarnings$GrandTotal <- rowSums(AllEarnings[,-1])
+write.csv(AllEarnings,"AllEarnings.csv")
+rm(AllEarningsGraph)
+
+#Earnings by Sources
+EarningsBySource <- summarise(group_by(OriginalData,PerfQtr, Work.Title,Genre,Music.User,Network.Service,
+                                       Day.Part.Code,Series.or.Film.Attraction,Performance.Type..Usage.), 
+                                       Earnings = sum(Dollars))
+
+#LocalTV Data
+LocalTV <- filter(EarningsBySource, Genre == "Local TV")
+LocalTV <- summarise(group_by(LocalTV,PerfQtr,Series.or.Film.Attraction),Earnings = sum(Earnings))
+LocalTV <- spread(LocalTV, PerfQtr, Earnings)
+LocalTV[is.na(LocalTV)] <- 0
+LocalTV$GrandTotal <- rowSums(LocalTV[,-1])
+LocalTV <- LocalTV[order(-LocalTV$GrandTotal),]
+LocalTV <- rbind(LocalTV, c("GrandTotal", colSums(LocalTV[,-1])))
+write.csv(LocalTV,"LocalTV.csv")
+rm(LocalTV)
+
+#Network TV
+NetworkTV <- filter(EarningsBySource, Genre == "Network TV")
+NetworkTV <- summarise(group_by(NetworkTV, PerfQtr,Series.or.Film.Attraction),Earnings = sum(Earnings))
+NetworkTV <- spread(NetworkTV, PerfQtr, Earnings)
+NetworkTV[is.na(NetworkTV)] <- 0
+NetworkTV$GrandTotal <- rowSums(NetworkTV[,-1])
+NetworkTV <- NetworkTV[order(-NetworkTV$GrandTotal),]
+NetworkTV <- rbind(NetworkTV, c("GrandTotal", colSums(NetworkTV[,-1])))
+write.csv(NetworkTV,"NetworkTV.csv")
+rm(NetworkTV)
+
+#Cable TV
+CableTV <- filter(EarningsBySource, Genre == "Cable TV")
+CableTV <- summarise(group_by(CableTV,PerfQtr, Series.or.Film.Attraction),Earnings = sum(Earnings))
+CableTV <- spread(CableTV, PerfQtr, Earnings)
+CableTV[is.na(CableTV)] <- 0
+CableTV$GrandTotal <- rowSums(CableTV[,-1])
+CableTV <- CableTV[order(-CableTV$GrandTotal),]
+CableTV <- rbind(CableTV, c("GrandTotal", colSums(CableTV[,-1])))
+write.csv(CableTV,"CableTV.csv")
+rm(CableTV)
+
+#Cable TV Networks
+CableTVNetworks <- filter(EarningsBySource, Genre == "Cable TV")
+CableTVNetworks <- summarise(group_by(CableTVNetworks,PerfQtr, Series.or.Film.Attraction),Earnings = sum(Earnings))
+CableTVNetworks <- spread(CableTVNetworks, PerfQtr, Earnings)
+CableTVNetworks[is.na(CableTVNetworks)]<-0
+CableTVNetworks$GrandTotal <- rowSums(CableTVNetworks[,-1])
+CableTVNetworks <- CableTVNetworks[order(-CableTVNetworks$GrandTotal),]
+CableTVNetworks <- rbind(CableTVNetworks, c("GrandTotal", colSums(CableTVNetworks[,-1])))
+write.csv(CableTVNetworks,"CableTVNetworks.csv")
+rm(CableTVNetworks)
+
+#BroadcastRadio
+BroadcastRadio  <- filter(EarningsBySource, Genre == "Broadcast Radio")
+BroadcastRadio <- spread(BroadcastRadio, PerfQtr, Earnings)
+BroadcastRadio$Music.User<- NULL
+BroadcastRadio$Network.Service <- NULL
+BroadcastRadio$Day.Part.Code <- NULL
+BroadcastRadio$Series.or.Film.Attraction <- NULL
+BroadcastRadio$Genre <- NULL
+BroadcastRadio$Performance.Type..Usage. <- NULL
+BroadcastRadio[is.na(BroadcastRadio)]<-0
+BroadcastRadio$GrandTotal <- rowSums(BroadcastRadio[,-1])
+BroadcastRadio <- BroadcastRadio[order(-BroadcastRadio$GrandTotal),]
+BroadcastRadio <- rbind(BroadcastRadio, c("GrandTotal", colSums(BroadcastRadio[,-1])))
+write.csv(BroadcastRadio,"BroadcastRadio.csv")
+rm(BroadcastRadio)
+
+#Write OriginalData.csv and remove all Domestic Files
+write.csv(OriginalData,"Combined Data File.csv")
+rm(Earners,EarningsBySource)
+
+
+#Foreign Processing
+setwd("P:/R&A Shared Folder/Potential Affiliates/VSM Processing/Potential Affiliate Processing/ASCAP/ASCAP Foreign Output Files")
+
+#Foreign Earnings Summary
+AllForeign <- summarise(group_by(ForeignData, Statement.Recipient.Name, PerfQtr), Earnings = sum(X..TOTAL))
+AllForeign <- spread(AllForeign, PerfQtr, Earnings)
+AllForeign$GrandTotal <- rowSums(AllForeign[,-1])
+write.csv(AllForeign,"AllForeign.csv")
+
+#Foreign Earnings by Country
+ForeignbyCountry <- summarise(group_by(ForeignData, Country.Name, PerfQtr), Earnings = sum(X..TOTAL))
+ForeignbyCountry <- spread(ForeignbyCountry, PerfQtr, Earnings)
+ForeignbyCountry[is.na(ForeignbyCountry)] <- 0 
+ForeignbyCountry$GrandTotal <- rowSums(ForeignbyCountry[,-1])
+ForeignbyCountry <- ForeignbyCountry[order(-ForeignbyCountry$GrandTotal),]
+ForeignbyCountry <- rbind(ForeignbyCountry, c("GrandTotal", colSums(ForeignbyCountry[,-1])))
+write.csv(ForeignbyCountry,"ForeignbyCountry.csv")
+rm(ForeignbyCountry)
+
+#Join Domestic and Foreign Earnings to create General Earnings Summary
+GeneralEarningsSummary <- rbind(AllEarnings, AllForeign)
+GeneralEarningsSummary <- setattr(GeneralEarningsSummary, "row.names", c("Domestic", "Foreign"))
+GeneralEarningsSummary$Statement.Recipient.Name <- NULL
+GeneralEarningsSummary["Grand Total",] <- colSums(GeneralEarningsSummary)
+write.csv(GeneralEarningsSummary, "GeneralEarningsSummary.csv")
+rm(GeneralEarningsSummary)
+
+#General Earnings Summary Plot
+AllEarnings <- summarise(group_by(OriginalData, Statement.Recipient.Name, PerfQtr), Earnings = sum(Dollars))
+AllForeign <- summarise(group_by(ForeignData, Statement.Recipient.Name, PerfQtr), Earnings = sum(X..TOTAL))
+GeneralEarnings <- AllForeign
+GeneralEarnings$Domestic <- AllEarnings$Earnings
+GeneralEarnings$Foreign <- AllForeign$Earnings
+GeneralEarnings$Statement.Recipient.Name <- NULL
+GeneralEarnings$Earnings <- NULL
+MidPoints <- GeneralEarnings
+MidPoints$Foreign <- MidPoints$Foreign/2 + MidPoints$Domestic
+MidPoints$Domestic <- MidPoints$Domestic/2
+GeneralEarnings <- melt(GeneralEarnings, id.vars = "PerfQtr")
+MidPoints <- melt(MidPoints, id.vars = "PerfQtr")
+GeneralEarnings$Mid <- MidPoints$value
+GeneralEarnings$PerfQtr <- as.character(AllEarnings$PerfQtr)
+png("GeneralEarningsSummary.png", width = 850, height = 680)
+ggplot(GeneralEarnings, aes(x=PerfQtr, y=value, fill=variable)) + geom_bar(stat = 'identity') + scale_fill_manual(values = c("olivedrab3","black")) + geom_text(aes(y = Mid, label = ifelse(GeneralEarnings$value >= 100, dollar(value), NA)), size = 3, colour = "white") + xlab("Performance Quarter") + ylab("Earnings") + ggtitle("General Earnings Summary") + theme(legend.title = element_blank()) + guides(fill=guide_legend(reverse=TRUE)) + scale_y_continuous("Earnings", labels = dollar) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.background = element_blank(), axis.line = element_line(colour = "gray40"))  
+dev.off()
+
+#Global Earnings Plot
+worlddata <- map_data('world') %>% data.table()
+worlddata <- worlddata[region!='Antarctica',]
+GlobalEarnings <- summarise(group_by(ForeignData, Country.Name), value = sum(X..TOTAL))
+GlobalEarnings$region <- tolower(GlobalEarnings$Country.Name)
+GlobalEarnings$Country.Name <- NULL
+worlddata$region <- tolower(worlddata$region)
+GlobalPlotData <- right_join(GlobalEarnings, worlddata)
+png("GlobalEarningsPlot.png", width = 1200, height = 680)
+ggplot(GlobalPlotData, aes(long, lat, group = group, fill = value)) + ggtitle("Global Earnings") + theme(axis.title.x = element_blank()) + theme(axis.title.y = element_blank()) + theme(axis.text = element_blank(), axis.ticks = element_blank()) + geom_polygon(aes(fill = value)) + geom_polygon(data = GlobalPlotData) + scale_fill_gradient(low = "black", high = "olivedrab3") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.background = element_blank())
+dev.off()
+
+#Make sure you have all output files before completing this next step
+setwd("P:/R&A Shared Folder/Potential Affiliates/VSM Processing/Potential Affiliate Processing/ASCAP")
+write.csv(OriginalData, "originalData.csv")
+write.csv(OriginalDataBackup, "OriginalDataBackup.csv")
+rm(AllEarnings,AllForeign,ForeignData,MidPoints,GeneralEarnings,OriginalData,OriginalDataBackup)
+
+#RUNNING ESTIMATES/COMPARISONS
+
+#Finding Top 5 LocalTVShows
+Top5LocalTV <- summarise(group_by(OriginalData,PerfQtr, Genre, SHOW.NAME), Earnings = sum(ROYALTY.AMOUNT))
+Top5LocalTV <- filter(Top5LocalTV, Genre == "LOCAL TELEVISION")
+Top5LocalTV <- spread(Top5LocalTV, PerfQtr, Earnings)
+Top5LocalTV$Genre <- NULL
+Top5LocalTV[is.na(Top5LocalTV)]<-0
+Top5LocalTV$GrandTotal <- rowSums(Top5LocalTV[,-1])
+Top5LocalTV <- Top5LocalTV[order(-Top5LocalTV$GrandTotal)[1:5],]
+x <- Top5LocalTV$SHOW.NAME
+t = as.list(x)
+names(t) = x
+
+#LocalTV for TV Analysis (Filter for Top Earning Shows)
+LocalTVEstimates <- filter(EarningsBySource, Genre == "LOCAL TELEVISION")
+LocalTVEstimates <- {filter(LocalTVEstimates,SHOW.NAME == x[1] | SHOW.NAME == x[2] | SHOW.NAME == x[3] | 
+                              SHOW.NAME == x[4] | SHOW.NAME == x[5])
+}  
+LocalTVEstimates <- spread(LocalTVEstimates, PerfQtr, Earnings)
+LocalTVEstimates$SHOW.. <- NULL
+LocalTVEstimates$USE.CODE <- NULL
+LocalTVEstimates$Genre <- NULL
+LocalTVEstimates$TITLE.NAME <- NULL
+TopLocalTVEstimates <- LocalTVEstimates[,1:6]
+TopLocalTVEstimates$MRQ <- LocalTVEstimates[,ncol(LocalTVEstimates)]
+y <- colnames(LocalTVEstimates[,ncol(LocalTVEstimates)])
+LocalTVEstimates <- {subset(LocalTVEstimates, select=c("SHOW.NAME","EPISODE.NAME","PERF.SOURCE",
+                                                       "USE.TYPE","WtdMins","PARTICIPANT...1",y))
+}
+rm(x)
+rm(y)
+rm(Top5LocalTV)
+rm(TopLocalTVEstimates)
+LocalTVEstimates <- na.omit(LocalTVEstimates)
+LocalTVEstimates <- {aggregate(cbind(LocalTVEstimates$WtdMins, LocalTVEstimates[,ncol(LocalTVEstimates)]),
+                               by=list(LocalTVEstimates$SHOW.NAME, LocalTVEstimates$EPISODE.NAME, LocalTVEstimates$PERF.SOURCE,
+                                       LocalTVEstimates$USE.TYPE, LocalTVEstimates$PARTICIPANT...1), FUN=sum)
+}
+LocalTVEstimates <- LocalTVEstimates[order(-LocalTVEstimates[,ncol(LocalTVEstimates)]),]
+
+
+#Finding the Top 5 CableTVShows
+Top5CableTV <- summarise(group_by(OriginalData,PerfQtr, Genre, SHOW.NAME), Earnings = sum(ROYALTY.AMOUNT))
+Top5CableTV <- filter(Top5CableTV, Genre == "CABLE TELEVISION")
+Top5CableTV <- spread(Top5CableTV, PerfQtr, Earnings)
+Top5CableTV$Genre <- NULL
+Top5CableTV[is.na(Top5CableTV)]<-0
+Top5CableTV$GrandTotal <- rowSums(Top5CableTV[,-1])
+Top5CableTV <- Top5CableTV[order(-Top5CableTV$GrandTotal)[1:5],]
+x <- Top5CableTV$SHOW.NAME
+t = as.list(x)
+names(t) = x
+
+AS400 <- odbcConnect("AS400")
+
+#Pulls Show Airings for Top 5 Shows
+AllShowAirings <- NULL
+for(i in names(t)){
+  ShowAirings <- sqlQuery(AS400,paste0("SELECT distinct(PGKEY), PGTTL,PGYEAR,PGEPNO,PGAENO,PGEPTL,PGNSYN,PGAIRD
+                                       FROM SALLIB.ALTMPGPF
+                                       WHERE pgttl = '",i,"'"))
+  AllShowAirings <- rbind(AllShowAirings, ShowAirings)
+  rm(ShowAirings)
+}
+PGKEY  <- as.character(AllShowAirings$PGKEY)
+u <- as.list(PGKEY)
+names(u) = PGKEY
+
+#TimeZoneData
+TimeZoneData <- NULL
+for(i in 1:length(PGKEY)){
+  TZBINDER <- sqlQuery(AS400,paste0("SELECT asstn,ststid,stcall,ststnm,sttimz,askey,asaird,asairt,asprim,asdura,asnsyn 
+                                    FROM sallib.altmaspf 
+                                    INNER JOIN sallib.altmstpf 
+                                    ON asstn=ststn
+                                    WHERE askey = '",PGKEY[1] | PGKEY[2] | PGKEY[3] | PGKEY [4],"'"))
+}
+
+for(i in names(u)){
+  TZBINDER <- sqlQuery(AS400, paste0("SELECT asstn.altmaspf, ststid.altmstpf, stcall.altmstpf, ststnm.altmstpf, sttimz.altmstpf, askey.altmaspf, pgttl.AllShowAirings, pgepno.AllShowAirings, pgeptl.AllShowAirings, pgaeno.AllShowAirings, pgaird.AllShowAirings, asaird.altmaspf, asairt.almaspf, asprim.altmaspf, asdura.altmaspf, asnsyn.altmaspf
+                                     FROM sallib.altmaspf, sallib.altmstpf, afqrylib.AllShowAirings
+                                     INNER JOIN asstn.altmaspf = ststn.altmstpf and askey.altmaspf = pgkey.AllShowAirings
+                                     WHERE asaird saird between 20150301 and 20150630"))
+}
+TimeZoneData <- rbind(TimeZoneData,TZBINDER)
+TimeZoneData <- join(TimeZoneData, AllShowAirings, by = (TimeZoneData$askey = AllShowAirings$PGKEY))
+rm(TZBINDER)
+}
+
+for(i in 1:length(PGKEY)){
+  DF <- sqlQuery(AS400,paste0("SELECT asstn.altmaspf, ststid.altmstpf, stcall.altmstpf, ststnm.altmstpf, sttimz.altmstpf, askey.altmaspf, asaird.altmaspf, asairt.altmaspf, asprim.altmaspf, asdura.altmaspf, asnsyn.altmaspf 
+                              FROM sallib.altmaspf 
+                              INNER JOIN sallib.altmaspf.asstn 
+                              ON sallib.altmstpf.ststn 
+                              WHERE sallib.altmaspf.askey = '",PGKEY[i],"'"))
+}
+
+#CableTV for TV Analysis (Filter for Top Earning Shows)
+CableTVEstimates <- filter(EarningsBySource, Genre == "CABLE TELEVISION")
+CableTVEstimates <- {filter(CableTVEstimates,SHOW.NAME == x[1] | SHOW.NAME == x[2] | SHOW.NAME == x[3] | 
+                              SHOW.NAME == x[4] | SHOW.NAME == x[5])
+}  
+CableTVEstimates <- spread(CableTVEstimates, PerfQtr, Earnings)
+CableTVEstimates$SHOW.. <- NULL
+CableTVEstimates$USE.CODE <- NULL
+CableTVEstimates$Genre <- NULL
+CableTVEstimates$TITLE.NAME <- NULL
+TopCableTVEstimates <- CableTVEstimates[,1:6]
+TopCableTVEstimates$MRQ <- CableTVEstimates[,ncol(CableTVEstimates)]
+y <- colnames(CableTVEstimates[,ncol(CableTVEstimates)])
+CableTVEstimates <- {subset(CableTVEstimates, select=c("SHOW.NAME","EPISODE.NAME","PERF.SOURCE",
+                                                       "USE.TYPE","WtdMins","PARTICIPANT...1",y))
+}
+rm(x)
+rm(y)
+rm(Top5CableTV)
+rm(TopCableTVEstimates)
+CableTVEstimates <- na.omit(CableTVEstimates)
+CableTVEstimates <- {aggregate(cbind(CableTVEstimates$WtdMins, CableTVEstimates[,ncol(CableTVEstimates)]), 
+                               by=list(CableTVEstimates$SHOW.NAME, CableTVEstimates$EPISODE.NAME, CableTVEstimates$PERF.SOURCE,
+                                       CableTVEstimates$USE.TYPE, CableTVEstimates$PARTICIPANT...1), FUN=sum)
+}
+CableTVEstimates <- CableTVEstimates[order(-CableTVEstimates[,ncol(CableTVEstimates)]),]
+
+#Finding the Top 5 NetworkTVShows
+Top5NetworkTV <- summarise(group_by(OriginalData,PerfQtr, Genre, SHOW.NAME), Earnings = sum(ROYALTY.AMOUNT))
+Top5NetworkTV <- filter(Top5NetworkTV, Genre == "NETWORK TELEVISION")
+Top5NetworkTV <- spread(Top5NetworkTV, PerfQtr, Earnings)
+Top5NetworkTV$Genre <- NULL
+Top5NetworkTV[is.na(Top5NetworkTV)]<-0
+Top5NetworkTV$GrandTotal <- rowSums(Top5NetworkTV[,-1])
+Top5NetworkTV <- Top5NetworkTV[order(-Top5NetworkTV$GrandTotal)[1:5],]
+x <- Top5NetworkTV$SHOW.NAME
+
+#NetworkTV for TV Analysis (Filter for Top Earning Shows)
+NetworkTVEstimates <- filter(EarningsBySource, Genre == "NETWORK TELEVISION")
+NetworkTVEstimates <- {filter(NetworkTVEstimates, SHOW.NAME == x[1] | SHOW.NAME == x[2] | SHOW.NAME == x[3] |
+                                SHOW.NAME == x[4] | SHOW.NAME == x[5])
+}
+NetworkTVEstimates <- spread(NetworkTVEstimates, PerfQtr, Earnings)
+NetworkTVEstimates$SHOW.. <- NULL
+NetworkTVEstimates$USE.CODE <- NULL
+NetworkTVEstimates$Genre <- NULL
+NetworkTVEstimates$TITLE.NAME <- NULL
+TopNetworkTVEstimates <- NetworkTVEstimates[,1:6]
+TopNetworkTVEstimates$MRQ <- NetworkTVEstimates[,ncol(NetworkTVEstimates)]
+y <- colnames(NetworkTVEstimates[,ncol(NetworkTVEstimates)])
+NetworkTVEstimates <- {subset(NetworkTVEstimates, select=c("SHOW.NAME","EPISODE.NAME","PERF.SOURCE",
+                                                           "USE.TYPE","WtdMins","PARTICIPANT...1",y))
+}
+rm(x)
+rm(y)
+rm(Top5NetworkTV)
+rm(TopNetworkTVEstimates)
+NetworkTVEstimates <- na.omit(NetworkTVEstimates)
+NetworkTVEstimates <- {aggregate(cbind(NetworkTVEstimates$WtdMins, NetworkTVEstimates[,ncol(NetworkTVEstimates)]),
+                                 by=list(NetworkTVEstimates$SHOW.NAME, NetworkTVEstimates$EPISODE.NAME, NetworkTVEstimates$PERF.SOURCE,
+                                         NetworkTVEstimates$USE.TYPE, NetworkTVEstimates$PARTICIPANT...1), FUN=sum)
+}
+NetworkTVEstimates <- NetworkTVEstimates[order(-NetworkTVEstimates[,ncol(NetworkTVEstimates)]),]
+
+#RADIO COMPARISON
+Top5Radio <- summarise(group_by(OriginalData,PerfQtr, Genre, TITLE.NAME), Earnings = sum(ROYALTY.AMOUNT))
+Top5Radio <- filter(Top5Radio, Genre == "RADIO")
+Top5Radio <- spread(Top5Radio, PerfQtr, Earnings)
+Top5Radio$Genre <- NULL
+Top5Radio[is.na(Top5Radio)]<-0
+Top5Radio$GrandTotal <- rowSums(Top5Radio[,-1])
+Top5Radio <- Top5Radio[order(-Top5Radio$GrandTotal)[1:5],]
+x <- Top5Radio$TITLE.NAME
+
+#RADIO COMPARISON Cont...
+RadioComparison <- filter(EarningsBySource, Genre == "RADIO")
+RadioComparison <- {filter(RadioComparison, TITLE.NAME == x[1] | TITLE.NAME == x[2] | TITLE.NAME == x[3] |
+                             TITLE.NAME == x[4] | TITLE.NAME == x[5])
+}
+RadioComparison <- spread(RadioComparison, PerfQtr, Earnings)
+RadioComparison$SHOW.NAME <- NULL
+RadioComparison$EPISODE.NAME <- NULL
+RadioComparison$PERF.SOURCE <- NULL
+RadioComparison$USE.TYPE <- NULL
+RadioComparison$WtdMins <- NULL
+RadioComparison$SHOW.. <- NULL
+RadioComparison$USE.CODE <- NULL
+RadioComparison$Genre <- NULL
+RadioComparison[is.na(RadioComparison)]<-0
+z <- tail(colnames(RadioComparison),4)
+RadioComparison$MRYTotal <- rowSums(RadioComparison[, z[1:4]])
+RadioComparison <- subset(RadioComparison, select=c("TITLE.NAME","PARTICIPANT...1","MRYTotal"))
+RadioComparison <- RadioComparison[order(-RadioComparison$MRYTotal),]
+rm(z)
+rm(Top5Radio)
+
+#ESTIMATED EARNINGS
+u <- as.list(x)
+BDSIDFun = function(i) {
+  sqlQuery(AS400,paste0("SELECT BRBSG#,BRSGTL,BRARNM
+                        FROM SBRLIB.BRDSNGPF
+                        WHERE BRSGTL = '",i,"'"))
+}
+BDSIDs <- rbindlist(lapply(u, BDSIDFun))
+
+#BEFORE EXECUTING THE BELOW COMMAND, ENSURE THAT ALL THE DATA FILES NEEDED ARE IN THE WORKING DIRECTORY
+rm(list=ls())
+
